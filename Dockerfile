@@ -32,10 +32,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # (libcuda.so via the container toolkit). This base also works CPU-only.
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime
 
-# libgomp1 is required by torch; ca-certificates for HF downloads.
-# Ubuntu 24.04 images may already ship a UID 1000 user; reuse it if present.
+# libgomp1 is required by torch; ca-certificates for HF downloads; sox quiets
+# the `sox` python package's startup warning; gcc serves Triton (CUDA compile)
+# and g++ serves Inductor's CPU C++ wrappers -- both are needed for the
+# torch.compile path (see TORCH_DISABLE_NATIVE_JIT below for why the eager
+# path stays compiler-free). Ubuntu 24.04 images may already ship a UID 1000
+# user; reuse it if present.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+    && apt-get install -y --no-install-recommends libgomp1 ca-certificates sox gcc g++ \
     && rm -rf /var/lib/apt/lists/* \
     && (getent passwd 1000 > /dev/null || useradd --create-home --uid 1000 app)
 
@@ -48,9 +52,21 @@ COPY --from=builder --chown=1000:1000 /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     QWEN3TTS_MODEL_DIR=/data/models \
-    HF_HOME=/data/hf
+    HF_HOME=/data/hf \
+    # linux torch bundles Triton; without this its native-op registry reroutes
+    # tiny bmms (RoPE) to Triton kernels and dies on first use because the slim
+    # image has no C compiler. Eager/cuBLAS is what we want (see __main__.py).
+    # NOTE: this kill switch only affects the eager torch._native registry --
+    # torch.compile/Inductor generates its own Triton kernels independently.
+    TORCH_DISABLE_NATIVE_JIT=1 \
+    # torch.compile (Inductor/Triton): enabled by default in the image; the
+    # caches live on the /data volume so the multi-minute first compile
+    # happens once per model, not once per container.
+    QWEN3TTS_COMPILE=1 \
+    TORCHINDUCTOR_CACHE_DIR=/data/compile-cache/inductor \
+    TRITON_CACHE_DIR=/data/compile-cache/triton
 
-RUN mkdir -p /data/models /data/hf && chown -R 1000:1000 /data
+RUN mkdir -p /data/models /data/hf /data/compile-cache && chown -R 1000:1000 /data
 USER 1000
 VOLUME /data
 

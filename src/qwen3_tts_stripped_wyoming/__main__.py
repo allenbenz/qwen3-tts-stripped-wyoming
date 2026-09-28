@@ -4,7 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+
+# PyPI linux torch bundles Triton, and torch >= 2.14's native-op registry
+# silently routes tiny outer-product bmms (e.g. the TTS RoPE matmul) to a
+# Triton kernel. Triton JIT-compiles its bootstrap module with the system C
+# compiler at runtime, which slim containers don't have. We run eager
+# inference only (no torch.compile), so disable the registry and keep aten /
+# cuBLAS. setdefault: an explicit env value still wins.
+os.environ.setdefault("TORCH_DISABLE_NATIVE_JIT", "1")
 
 from .config import build_arg_parser, settings_from_args
 from .server import run_server

@@ -63,6 +63,22 @@ Only `custom_voice` models are convertible: Base (voice-clone) models need the s
 - `lite` vs `bf16`: identical codec-token streams with identical seeds (bit-exact talker); the fp16 speech-tokenizer decoder measures ~37 dB SNR / mel-corr 1.0000 vs fp32.
 - `q8` vs `lite`: same-context next-token argmax agreement 100% across sampled steps, top-50 overlap 96–99%, KL ≤ 1e-2; sampled audio differs token-wise (any near-lossless quantization diverges under sampling — same class as re-seeding the model) but produces valid narrations.
 
+## Performance
+
+Measured on an RTX 3090 (bf16, ~7.5 s of audio per request, eager inference):
+
+| Configuration | Real-time factor | Notes |
+| --- | --- | --- |
+| `lite` (bf16) | 1.7x | baseline; fastest |
+| `q8` | 2.3x | int8 → fp32 → bf16 on every decode step; ~1.5 GB less VRAM, 2.4 GB on disk |
+
+Notes:
+
+- **torch.compile / Triton (experimental, opt-in via `QWEN3TTS_COMPILE=1`; enabled by default in the Docker image).** Because decode is launch-bound (see below), Inductor fusion is the one remaining speed lever. The server compiles the talker and code-predictor stacks at first inference (`mode=default`, `dynamic=True`; both configurable) and caches the artifacts under `/data/compile-cache` in Docker, so the multi-minute compile happens once per model, not per container. Measured on CPU (podman, 8 cores): the full path compiles and synthesizes correctly; expect ~1.5–2.5x on GPU, but treat it as an experiment — if anything misbehaves set `QWEN3TTS_COMPILE=0`. Inductor needs a C/C++ compiler at runtime (the image ships `gcc`+`g++`; venv users need them in PATH — the server checks and falls back to eager with a clear log line when missing).
+- **The `flash-attn is not installed` warning is noise.** It is printed unconditionally at import time by the (unused) 25 Hz tokenizer's whisper encoder. The talker, 12 Hz speech tokenizer, and ASR all resolve to **SDPA** attention (`sdpa` in the startup logs), which at these sequence lengths (~100 tokens) is within noise of flash-attn. Installing flash-attn is not worth pinning a torch-2.14-matching wheel for.
+- The remaining gap to real time is the qwen-tts eager stack itself: per audio frame it runs one 28-layer talker step plus 15 small code-predictor steps, so decode is kernel-launch-bound rather than attention- or bandwidth-bound. `torch.compile` would help but pulls Triton JIT (compiler in the image) — deliberately out of scope.
+- Rule of thumb: `lite` when speed matters (bit-exact and fastest); `q8` when VRAM or disk is the constraint (~35% slower for ~1.5 GB less VRAM and a 2.4 GB payload). Materializing q8 weights to bf16 at load time would just recreate `lite`'s runtime, so no such option exists.
+
 ## Docker
 
 ```sh
@@ -113,6 +129,9 @@ Every setting is available as an environment variable and as a CLI flag of the s
 | `QWEN3TTS_KEEP_SET` | `latin` | Vocabulary keep-set when converting (`latin` or `ml`) |
 | `QWEN3TTS_ST_DTYPE` | `float16` | Speech-tokenizer decoder storage dtype when converting |
 | `QWEN3TTS_Q8_GROUP` | `64` | Inputs per int8 scale group when converting to q8 |
+| `QWEN3TTS_COMPILE` | `false` (`true` in the Docker image) | torch.compile the per-step decoder stacks (Inductor/Triton); first inference compiles — minutes, then cached. Needs `gcc` (CUDA/Triton) or `g++` (CPU) at runtime |
+| `QWEN3TTS_COMPILE_MODE` | `default` | `default` (fusion only, safest), `reduce-overhead` (adds CUDA graphs; may not engage with the growing KV cache), `max-autotune` (longest compile) |
+| `QWEN3TTS_COMPILE_DYNAMIC` | `true` | Compile with dynamic shapes so growing decode lengths don't recompile per step |
 | `QWEN3TTS_DOWNLOAD` | `auto` | `auto` downloads when missing, `always` re-downloads at startup, `never` fails if missing |
 | `QWEN3TTS_REVISION` | *(empty)* | Hugging Face revision to pin |
 | `HF_TOKEN` | *(empty)* | Passed through to `huggingface_hub` for gated or rate-limited downloads |
@@ -180,10 +199,13 @@ qwen-asr upgrade, revisit the override.
 
 ## Troubleshooting
 
-- **First start is slow** — the TTS source is downloaded (~4.5 GB for 1.7B) and converted when `--variant` selects a converted variant (minutes, CPU), plus the ASR model (~1.5 GB). All cached under `--model-dir`.
+- **First start is slow** — the TTS source is downloaded (~4.5 GB for 1.7B) and converted when `--variant` selects a converted variant (minutes, CPU), plus the ASR model (~1.5 GB). All cached under `--model-dir`. With `QWEN3TTS_COMPILE=1`, the first synthesis additionally compiles (minutes) and caches under `/data/compile-cache` (Docker) — make sure `/data` is a volume so the cache survives restarts.
+- **`torch.compile` requests fail with `InvalidCxxCompiler` / `Failed to find C compiler`** — the runtime toolchain is missing (`gcc` for CUDA/Triton, `g++` for CPU Inductor). The Docker image ships both; the server detects a missing toolchain at load and falls back to eager with a log line. In a venv, install a C/C++ compiler or set `QWEN3TTS_COMPILE=0`.
 - **GPU not used** — check startup logs; `device=cuda` fails fast with the reason, `auto` falls back to CPU (CPU-only torch build on Windows is the usual cause).
 - **Voice list missing speakers** — voices come from `config.json → talker_config.spk_id`; finetunes that add speakers appear automatically.
 - **Non-English text sounds wrong on a latin keep-set** — convert with `--keep-set ml` (Chinese/Japanese/Korean/Russian need the bigger keep-set); the server also logs a warning when input tokens fall outside the keep-set.
+- **`RuntimeError: Failed to find C compiler` (Docker)** — PyPI linux torch bundles Triton, and torch ≥ 2.14's native-op registry routes tiny outer-product matmuls (the TTS RoPE step) to Triton kernels that JIT-compile with the system C compiler at runtime. The image (and `__main__.py`) sets `TORCH_DISABLE_NATIVE_JIT=1` so eager/cuBLAS is used instead — nothing in this server needs Triton (no `torch.compile`). Set the variable to `0` only if you enable `torch.compile`, and then also add a C toolchain to the image.
+- **`sox: not found` warning** — the `sox` *python* package probing for its (unused) binary; harmless. The Docker image installs the `sox` binary purely to quiet the log line.
 - **STT missing from Home Assistant** — the ASR model failed to load at startup (see the server logs); the server keeps running TTS-only and answers STT requests with `asr-disabled`.
 
 ## License

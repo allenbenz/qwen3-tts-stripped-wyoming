@@ -291,6 +291,34 @@ def _fallback_languages() -> tuple[str, ...]:
     )
 
 
+def apply_torch_compile(tts_model: Any, *, mode: str, dynamic: bool) -> list[str]:
+    """torch.compile the per-step decoder stacks of a loaded TTS model.
+
+    Compiling the top-level model would be a no-op: ``generate()`` resolves
+    bound methods on the original module, bypassing an OptimizedModule
+    wrapper. Instead the inner submodules that the parent forward invokes via
+    ``self.model(...)`` are replaced, so those calls dispatch into compiled
+    regions. Compiling also fuses Q8Linear's int8 dequant into the GEMMs.
+
+    Returns the compiled target paths.
+    """
+    import torch
+
+    talker = tts_model.talker
+    candidates: list[tuple[str, Any, str]] = [("talker.model", talker, "model")]
+    predictor = getattr(talker, "code_predictor", None)
+    if predictor is not None:
+        candidates.append(("talker.code_predictor.model", predictor, "model"))
+    compiled = []
+    for path, parent, name in candidates:
+        module = getattr(parent, name, None)
+        if module is None:
+            continue
+        setattr(parent, name, torch.compile(module, mode=mode, dynamic=dynamic))
+        compiled.append(path)
+    return compiled
+
+
 def _load_model_sync(model_dir: Path, settings: Settings, variant: str) -> tuple[Any, bool]:
     import torch
 
@@ -322,4 +350,47 @@ def _load_model_sync(model_dir: Path, settings: Settings, variant: str) -> tuple
         dtype,
     )
     model = Qwen3TTSModel.from_pretrained(str(model_dir), device_map=device_map, dtype=torch_dtype)
+    if settings.compile:
+        missing = _missing_compile_toolchain(using_cuda)
+        if missing:
+            _LOGGER.error(
+                "QWEN3TTS_COMPILE=1 but the Inductor toolchain is incomplete "
+                "(missing %s); falling back to eager. The Docker image ships "
+                "gcc+g++; for venv installs add a C/C++ compiler to PATH.",
+                ", ".join(missing),
+            )
+        else:
+            import torch._dynamo
+
+            # a failing region logs and falls back to eager instead of killing
+            # the server; the whole feature is experimental
+            torch._dynamo.config.suppress_errors = True
+            compiled = apply_torch_compile(
+                model.model, mode=settings.compile_mode, dynamic=settings.compile_dynamic
+            )
+            _LOGGER.info(
+                "torch.compile enabled (mode=%s, dynamic=%s) on %s; the first "
+                "inference triggers compilation -- expect minutes, cached under "
+                "TORCHINDUCTOR_CACHE_DIR for subsequent starts",
+                settings.compile_mode,
+                settings.compile_dynamic,
+                ", ".join(compiled),
+            )
     return model, using_cuda
+
+
+def _missing_compile_toolchain(using_cuda: bool) -> list[str]:
+    """Compilers Inductor/Triton need at runtime, by device.
+
+    CUDA compilation goes through Triton (C compiler); CPU compilation builds
+    C++ wrappers (C++ compiler). Missing tools disable compile up front --
+    otherwise every synthesis request would fail at first inference.
+    """
+    import shutil
+
+    missing = []
+    if using_cuda and not (shutil.which("gcc") or shutil.which("cc")):
+        missing.append("gcc (Triton kernel compilation)")
+    if not using_cuda and not (shutil.which("g++") or shutil.which("c++")):
+        missing.append("g++ (Inductor CPU wrappers)")
+    return missing

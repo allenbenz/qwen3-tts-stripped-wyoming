@@ -24,6 +24,7 @@ VALID_DOWNLOAD_MODES = ("auto", "always", "never")
 VALID_DEVICES = ("auto", "cuda", "cpu")
 VALID_DTYPES = ("auto", "bfloat16", "float16", "float32")
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+VALID_COMPILE_MODES = ("default", "reduce-overhead", "max-autotune")
 
 DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 
@@ -63,6 +64,9 @@ class Settings:
     asr_language: str | None = None
     asr_max_new_tokens: int | None = None
     asr_context: bool = True
+    compile: bool = False
+    compile_mode: str = "default"
+    compile_dynamic: bool = True
     log_level: str = "INFO"
 
     def __post_init__(self) -> None:
@@ -98,6 +102,10 @@ class Settings:
             raise ValueError(f"energy_gain must be >= 0, got {self.energy_gain}")
         if self.asr_max_new_tokens is not None and self.asr_max_new_tokens <= 0:
             raise ValueError(f"asr_max_new_tokens must be > 0, got {self.asr_max_new_tokens}")
+        if self.compile_mode not in VALID_COMPILE_MODES:
+            raise ValueError(
+                f"compile_mode must be one of {VALID_COMPILE_MODES}, got {self.compile_mode!r}"
+            )
         if self.output_chunk_ms < MIN_OUTPUT_CHUNK_MS:
             raise ValueError(
                 f"output_chunk_ms must be >= {MIN_OUTPUT_CHUNK_MS}, got {self.output_chunk_ms}"
@@ -192,13 +200,21 @@ def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
     if (flag := _env_bool(source, "WARMUP")) is not None:
         kwargs["warmup"] = flag
     # empty string disables the ASR side; absent keeps the default model
-    if (text := _raw(source, "ASR_MODEL")) is not None:
-        kwargs["asr_model"] = text
+    # NB: an explicitly-empty (or whitespace) value disables STT, unlike the
+    # other string settings where empty means "unset"
+    if ENV_PREFIX + "ASR_MODEL" in source:
+        kwargs["asr_model"] = _raw(source, "ASR_MODEL") or None
     kwargs["asr_language"] = _raw(source, "ASR_LANGUAGE")
     if (count := _env_int(source, "ASR_MAX_NEW_TOKENS")) is not None:
         kwargs["asr_max_new_tokens"] = count
     if (flag := _env_bool(source, "ASR_CONTEXT")) is not None:
         kwargs["asr_context"] = flag
+    if (flag := _env_bool(source, "COMPILE")) is not None:
+        kwargs["compile"] = flag
+    if text := _raw(source, "COMPILE_MODE"):
+        kwargs["compile_mode"] = text.lower()
+    if (flag := _env_bool(source, "COMPILE_DYNAMIC")) is not None:
+        kwargs["compile_dynamic"] = flag
     if text := _raw(source, "LOG_LEVEL"):
         kwargs["log_level"] = text.upper()
 
@@ -424,6 +440,40 @@ def build_arg_parser(env: Mapping[str, str] | None = None) -> argparse.ArgumentP
         default=base.asr_context,
         help="forward the Wyoming transcribe context (names/terms) to the model "
         "(env QWEN3TTS_ASR_CONTEXT)",
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=base.compile,
+        help=(
+            "torch.compile the per-step decoder stacks (talker + code predictor) "
+            "with Inductor/Triton. First inference compiles -- minutes, cached "
+            "under TORCHINDUCTOR_CACHE_DIR afterwards. Needs a C compiler at "
+            "runtime (the Docker image ships gcc; venv users need one in PATH) "
+            "(env QWEN3TTS_COMPILE)"
+        ),
+    )
+    parser.add_argument(
+        "--compile-mode",
+        dest="compile_mode",
+        choices=VALID_COMPILE_MODES,
+        default=base.compile_mode,
+        help=(
+            "torch.compile mode: default (fusion only, safest), "
+            "reduce-overhead (adds CUDA graphs; may not engage with the growing "
+            "KV cache), max-autotune (longest compile) "
+            "(env QWEN3TTS_COMPILE_MODE)"
+        ),
+    )
+    parser.add_argument(
+        "--compile-dynamic",
+        dest="compile_dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=base.compile_dynamic,
+        help=(
+            "compile with dynamic shapes so the growing decode sequence does "
+            "not trigger recompilation per length (env QWEN3TTS_COMPILE_DYNAMIC)"
+        ),
     )
     parser.add_argument(
         "--log-level",
