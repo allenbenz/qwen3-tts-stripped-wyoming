@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+  schedule:
+    # Weekly model e2e: Monday 05:00 UTC
+    - cron: "0 5 * * 1"
+
+# Cancel superseded runs on the same branch/PR instead of queueing them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    # ruff + mypy share one environment; splitting them just duplicated the
+    # checkout + python + uv sync setup on every run.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen mypy src
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Run unit and integration tests
+        run: uv run --frozen pytest -m "not e2e and not docker" -v
+
+  e2e:
+    # Real models on CPU; downloads ~4.5 GB TTS source + ~1.5 GB ASR model and
+    # converts to q8 (cached). Manual + weekly only (disabled on ordinary
+    # pushes/PRs to save runner time).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'schedule' && github.repository_owner == 'allenbenz')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - uses: actions/cache@v4
+        with:
+          path: data/models
+          key: qwen3tts-models-${{ runner.os }}
+      - name: Run e2e tests
+        env:
+          QWEN3TTS_E2E: "1"
+          QWEN3TTS_DEVICE: cpu
+          QWEN3TTS_MODEL: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+          QWEN3TTS_ASR_MODEL: Qwen/Qwen3-ASR-0.6B
+        run: uv run --frozen pytest -m e2e -v

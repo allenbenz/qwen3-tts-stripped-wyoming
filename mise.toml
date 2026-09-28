@@ -1,0 +1,51 @@
+[tools]
+python = "3.12"
+uv = "latest"
+
+[tasks.install]
+description = "Install dependencies and create the virtual environment"
+run = "uv sync"
+
+[tasks.lock]
+description = "Regenerate uv.lock (commit the result)"
+run = "uv lock"
+
+[tasks.test]
+description = "Run unit and integration tests (skip e2e and docker)"
+run = 'uv run pytest -m "not e2e and not docker"'
+
+[tasks.test-unit]
+description = "Run unit tests only"
+run = "uv run pytest tests/unit"
+
+[tasks.test-integration]
+description = "Run integration tests only"
+run = "uv run pytest tests/integration"
+
+[tasks.test-e2e]
+description = "Run e2e tests against a real model (set QWEN3TTS_E2E=1)"
+run = "uv run pytest -m e2e"
+
+[tasks.test-docker]
+description = "Build and test the Docker image (set QWEN3TTS_DOCKER_E2E=1)"
+run = "uv run pytest -m docker"
+
+[tasks.lint]
+description = "Run ruff checks and verify formatting"
+run = "uv run ruff check . && uv run ruff format --check ."
+
+[tasks.format]
+description = "Format code and apply ruff autofixes"
+run = "uv run ruff format . && uv run ruff check --fix ."
+
+[tasks.typecheck]
+description = "Run mypy on the source tree"
+run = "uv run mypy src"
+
+[tasks.run]
+description = "Run the Wyoming TTS server"
+run = "uv run qwen3-tts-stripped-wyoming"
+
+[tasks.docker-build]
+description = "Build the Docker image for local development"
+run = "docker build -t qwen3-tts-stripped-wyoming:dev ."

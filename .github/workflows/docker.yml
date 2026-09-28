@@ -1,0 +1,83 @@
+# Builds and publishes the plain (non-addon) image to GHCR.
+# Derived from ha-crane-wyoming's builder.yaml, minus the Home Assistant addon
+# machinery (multi-arch addon manifest, HA builder): this is a normal image
+# Home Assistant's Wyoming integration connects to over tcp://host:10200.
+#
+# linux/amd64 only: the PyPI torch wheels bundle CUDA for x86_64, and this image
+# exists to leverage an NVIDIA GPU. It still runs CPU-only on amd64 when no GPU
+# is passed (--gpus all is only needed for CUDA).
+
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+
+# Cancel superseded runs instead of queueing duplicate work.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name (GHCR requires lowercase)
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.repo.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Two cache backends: the registry cache (a buildcache tag in GHCR)
+          # is durable and large enough to hold the ~3 GB CUDA base layers,
+          # which the 10 GB-capped gha cache evicts aggressively. Note RUN
+          # --mount=type=cache dirs are not exported by either backend; the
+          # expensive uv sync layer is covered by layer cache instead, keyed
+          # on pyproject.toml + uv.lock (copied before src/ in the Dockerfile).
+          cache-from: |
+            type=registry,ref=ghcr.io/${{ steps.repo.outputs.name }}:buildcache
+            type=gha
+          cache-to: |
+            type=registry,ref=ghcr.io/${{ steps.repo.outputs.name }}:buildcache,mode=max
+            type=gha,mode=max

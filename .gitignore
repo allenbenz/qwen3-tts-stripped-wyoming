@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Project
+data/
+*.log
+
+# Editor
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# NOTE: uv.lock is intentionally NOT ignored — it must be committed.

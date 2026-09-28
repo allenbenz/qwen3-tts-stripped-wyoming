@@ -1,0 +1,40 @@
+# Keep uv.lock — the Dockerfile needs it for reproducible builds.
+!uv.lock
+
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Environments
+.venv
+venv
+
+# Tests
+tests
+
+# Local model downloads / data
+data
+
+# Caches and build artifacts
+__pycache__
+*.pyc
+.mypy_cache
+.pytest_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# Editor / OS cruft
+.idea
+.vscode
+.DS_Store
+
+# Markdown except README.md (copied by the Dockerfile)
+*.md
+!README.md
+
+# Docker files themselves
+Dockerfile
+.dockerignore

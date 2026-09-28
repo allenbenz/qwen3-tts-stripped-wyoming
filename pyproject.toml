@@ -1,0 +1,94 @@
+[project]
+name = "qwen3-tts-stripped-wyoming"
+version = "0.1.0"
+description = "Wyoming-protocol TTS server for Qwen3-TTS CustomVoice models (bf16 / lite / int8-q8, CUDA or CPU)"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "qwen3-tts-stripped-wyoming contributors" }]
+requires-python = ">=3.12"
+keywords = ["wyoming", "tts", "text-to-speech", "home-assistant", "qwen3-tts"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "wyoming>=1.10,<2",
+    "numpy>=1.26",
+    "huggingface-hub>=0.30",
+    # qwen-tts pins transformers==4.57.3 / accelerate==1.12.0 exactly and pulls
+    # torchaudio (+ torch), soundfile, librosa, sox, onnxruntime, einops, gradio.
+    "qwen-tts>=0.1",
+    # qwen-asr (STT side of the server) pins transformers==4.57.6; the two
+    # qwen packages cannot agree, so transformers is overridden to qwen-tts's
+    # 4.57.3 below (patch-level difference, validated by the e2e suites).
+    "qwen-asr>=0.0.6",
+    "accelerate==1.12.0",
+    "safetensors>=0.4",
+]
+
+[tool.uv]
+# qwen-tts==0.1.1 requires transformers==4.57.3 while qwen-asr==0.0.6
+# requires transformers==4.57.6; both are patch releases of the same minor and
+# work with 4.57.3 in practice (the TTS modeling code is vendored inside
+# qwen-tts, and qwen-asr's usage is validated by tests/e2e). If the ASR e2e
+# breaks after a qwen-asr upgrade, revisit this override.
+override-dependencies = ["transformers==4.57.3"]
+
+[project.scripts]
+qwen3-tts-stripped-wyoming = "qwen3_tts_stripped_wyoming.__main__:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qwen3_tts_stripped_wyoming"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "e2e: end-to-end tests against a real model directory (enable with QWEN3TTS_E2E=1)",
+    "docker: tests that build and run the docker image (enable with QWEN3TTS_DOCKER_E2E=1)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "RUF"]
+
+[tool.mypy]
+files = ["src"]
+python_version = "3.12"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "wyoming.*",
+    "qwen_tts.*",
+    "qwen_asr.*",
+    "transformers.*",
+    "torch.*",
+    "torch.nn.*",
+    "safetensors.*",
+    "huggingface_hub.*",
+    "numpy",
+]
+ignore_missing_imports = true
