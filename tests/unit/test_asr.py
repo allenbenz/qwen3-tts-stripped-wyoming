@@ -126,3 +126,49 @@ def test_transcription_service_requires_model(fake_settings) -> None:
     # constructor only wires things; create() validates the source
     service = TranscriptionService(FakeAsrModel(), fake_settings, languages=("English",))
     assert service.languages == ("English",)
+
+
+class TestEnsureNativeFeatureExtractor:
+    """The load-time heal for stale (Whisper) feature extractor configs."""
+
+    def test_swaps_foreign_extractor(self) -> None:
+        from types import SimpleNamespace
+
+        from transformers.models.qwen3_asr.feature_extraction_qwen3_asr import (
+            Qwen3ASRFeatureExtractor,
+        )
+
+        from qwen3_tts_stripped_wyoming.asr import _ensure_native_feature_extractor
+
+        class FakeWhisper:
+            feature_size = 128
+            sampling_rate = 16000
+            hop_length = 160
+            n_fft = 400
+            dither = 0.0
+
+        processor = SimpleNamespace(feature_extractor=FakeWhisper())
+        audio_config = SimpleNamespace(num_mel_bins=128, n_window=50)
+        model = SimpleNamespace(config=SimpleNamespace(audio_config=audio_config))
+        _ensure_native_feature_extractor(processor, model)
+        fe = processor.feature_extractor
+        assert isinstance(fe, Qwen3ASRFeatureExtractor)
+        assert fe.n_window == 50
+        assert fe.min_length == 8000
+        assert fe.return_attention_mask is True
+        assert fe.feature_size == 128
+
+    def test_native_extractor_untouched(self) -> None:
+        from types import SimpleNamespace
+
+        from transformers.models.qwen3_asr.feature_extraction_qwen3_asr import (
+            Qwen3ASRFeatureExtractor,
+        )
+
+        from qwen3_tts_stripped_wyoming.asr import _ensure_native_feature_extractor
+
+        fe = Qwen3ASRFeatureExtractor()
+        processor = SimpleNamespace(feature_extractor=fe)
+        model = SimpleNamespace(config=SimpleNamespace(audio_config=None))
+        _ensure_native_feature_extractor(processor, model)
+        assert processor.feature_extractor is fe

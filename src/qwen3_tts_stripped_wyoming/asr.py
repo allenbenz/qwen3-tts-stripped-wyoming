@@ -225,7 +225,52 @@ def _load_asr_sync(model_dir: Path, settings: Settings) -> tuple[Any, tuple[str,
         str(model_dir), dtype=torch_dtype, device_map=device
     )
     processor = Qwen3ASRProcessor.from_pretrained(str(model_dir))
+    _ensure_native_feature_extractor(processor, model)
     return _NativeAsrWrapper(model, processor, settings.asr_max_new_tokens), _SUPPORTED_LANGUAGES
+
+
+def _ensure_native_feature_extractor(processor: Any, model: Any) -> None:
+    """Replace a foreign feature extractor with the native Qwen3ASR one.
+
+    4.57-era qwen-asr checkpoints declare ``WhisperFeatureExtractor`` in their
+    preprocessor config. That class computes compatible log-mel features but
+    does not right-pad the mel time axis to a multiple of ``2 * n_window``, so
+    the native encoder rejects most input lengths::
+
+        ValueError: ... `padded_feature_length` to be a multiple of
+        `n_window * 2` (100), but got 308.
+
+    Migration writes a corrected config, but checkpoints migrated by older
+    builds keep the stale entry, so heal at load time too.
+    """
+    from transformers.models.qwen3_asr.feature_extraction_qwen3_asr import (
+        Qwen3ASRFeatureExtractor,
+    )
+
+    if isinstance(processor.feature_extractor, Qwen3ASRFeatureExtractor):
+        return
+    old = processor.feature_extractor
+    audio_config = getattr(model.config, "audio_config", None)
+    feature_size = (
+        getattr(audio_config, "num_mel_bins", None) or getattr(old, "feature_size", None) or 128
+    )
+    n_window = getattr(audio_config, "n_window", None) or getattr(old, "n_window", None) or 50
+    processor.feature_extractor = Qwen3ASRFeatureExtractor(
+        feature_size=int(feature_size),
+        sampling_rate=int(getattr(old, "sampling_rate", 16000) or 16000),
+        hop_length=int(getattr(old, "hop_length", 160) or 160),
+        n_fft=int(getattr(old, "n_fft", 400) or 400),
+        dither=float(getattr(old, "dither", 0.0) or 0.0),
+        n_window=int(n_window),
+        min_length=8000,
+        return_attention_mask=True,
+    )
+    _LOGGER.warning(
+        "asr: preprocessor config declared %s; replaced with "
+        "Qwen3ASRFeatureExtractor (adds the 2*n_window mel padding the "
+        "encoder requires)",
+        type(old).__name__,
+    )
 
 
 class _NativeAsrWrapper:

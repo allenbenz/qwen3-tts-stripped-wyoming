@@ -547,6 +547,28 @@ def migrate_asr_for_transformers5(src: str | Path, dst: str | Path) -> Path:
         if key in thinker:
             cfg[key] = thinker[key]
 
+    # 4.57-era checkpoints declare WhisperFeatureExtractor, which lacks the
+    # mel-axis padding to 2*n_window that the native encoder requires; write
+    # a Qwen3ASRFeatureExtractor config instead of copying the stale one
+    pre: dict = {}
+    pre_src = src / "preprocessor_config.json"
+    if pre_src.is_file():
+        pre = json.loads(pre_src.read_text(encoding="utf-8"))
+    preprocessor_config = {
+        "feature_extractor_type": "Qwen3ASRFeatureExtractor",
+        "processor_class": "Qwen3ASRProcessor",
+        "feature_size": int(pre.get("feature_size") or audio.get("num_mel_bins") or 128),
+        "sampling_rate": int(pre.get("sampling_rate") or 16000),
+        "hop_length": int(pre.get("hop_length") or 160),
+        "n_fft": int(pre.get("n_fft") or 400),
+        "chunk_length": int(pre.get("chunk_length") or 30),
+        "padding_value": pre.get("padding_value", 0.0),
+        "dither": float(pre.get("dither") or 0.0),
+        "return_attention_mask": True,
+        "n_window": int(audio.get("n_window") or 50),
+        "min_length": 8000,
+    }
+
     tensors = load_file(str(src / "model.safetensors"), device="cpu")
     migrated: dict[str, torch.Tensor] = {}
     for key, value in tensors.items():
@@ -572,9 +594,13 @@ def migrate_asr_for_transformers5(src: str | Path, dst: str | Path) -> Path:
     (dst / "config.json").write_text(
         json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    (dst / "preprocessor_config.json").write_text(
+        json.dumps(preprocessor_config, indent=2), encoding="utf-8"
+    )
     for f in src.glob("*"):
         if f.is_file() and f.name not in (
             "config.json",
+            "preprocessor_config.json",
             "model.safetensors",
             "model.safetensors.index.json",
         ):

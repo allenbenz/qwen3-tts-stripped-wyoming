@@ -531,9 +531,11 @@ def _load_model_sync(model_dir: Path, settings: Settings, variant: str) -> tuple
         missing = _missing_compile_toolchain(using_cuda)
         if missing:
             _LOGGER.error(
-                "QWEN3TTS_COMPILE=1 but the Inductor toolchain is incomplete "
+                "QWEN3TTS_COMPILE=1 but the compile toolchain is incomplete "
                 "(missing %s); falling back to eager. The Docker image ships "
-                "gcc+g++; for venv installs add a C/C++ compiler to PATH.",
+                "no toolchain or Triton; to use torch.compile add gcc/g++ "
+                "(plus the triton package on CUDA) to the image, or run from "
+                "a venv with a C/C++ compiler in PATH.",
                 ", ".join(missing),
             )
         else:
@@ -557,17 +559,24 @@ def _load_model_sync(model_dir: Path, settings: Settings, variant: str) -> tuple
 
 
 def _missing_compile_toolchain(using_cuda: bool) -> list[str]:
-    """Compilers Inductor/Triton need at runtime, by device.
+    """What Inductor/Triton need at runtime, by device.
 
-    CUDA compilation goes through Triton (C compiler); CPU compilation builds
-    C++ wrappers (C++ compiler). Missing tools disable compile up front --
-    otherwise every synthesis request would fail at first inference.
+    CUDA compilation goes through Triton (a C compiler plus the triton
+    package); CPU compilation builds C++ wrappers (a C++ compiler). Missing
+    pieces disable compile up front -- otherwise every synthesis request
+    would fail at first inference. The Docker image ships none of these.
     """
+    import importlib
     import shutil
 
     missing = []
-    if using_cuda and not (shutil.which("gcc") or shutil.which("cc")):
-        missing.append("gcc (Triton kernel compilation)")
+    if using_cuda:
+        if not (shutil.which("gcc") or shutil.which("cc")):
+            missing.append("gcc (Triton kernel compilation)")
+        try:
+            importlib.import_module("triton")
+        except ImportError:
+            missing.append("triton (package)")
     if not using_cuda and not (shutil.which("g++") or shutil.which("c++")):
         missing.append("g++ (Inductor CPU wrappers)")
     return missing

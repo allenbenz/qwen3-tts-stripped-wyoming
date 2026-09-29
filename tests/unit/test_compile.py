@@ -147,3 +147,53 @@ class TestRevertTorchCompile:
         talker = types.SimpleNamespace(model=types.SimpleNamespace())
         tts_model = types.SimpleNamespace(talker=talker)
         assert runtime.revert_torch_compile(tts_model) == 0
+
+
+class TestMissingCompileToolchain:
+    """The upfront check that keeps a compiler-less image (the Docker image
+    ships no gcc/g++ and no triton) from crashing at first inference."""
+
+    def test_cuda_reports_missing_gcc_and_triton(self, monkeypatch) -> None:
+        import importlib
+        import shutil
+
+        from qwen3_tts_stripped_wyoming import runtime
+
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+
+        def fake_import(name: str, *args: object) -> object:
+            if name == "triton":
+                raise ImportError(name)
+            return importlib.import_module(name, *args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(importlib, "import_module", fake_import)
+
+        missing = runtime._missing_compile_toolchain(using_cuda=True)
+        assert any("gcc" in item for item in missing)
+        assert any("triton" in item for item in missing)
+
+    def test_cpu_reports_missing_gpp(self, monkeypatch) -> None:
+        import shutil
+
+        from qwen3_tts_stripped_wyoming import runtime
+
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+        missing = runtime._missing_compile_toolchain(using_cuda=False)
+        assert any("g++" in item for item in missing)
+
+    def test_complete_toolchain_is_silent(self, monkeypatch) -> None:
+        import importlib
+        import types as types_mod
+
+        from qwen3_tts_stripped_wyoming import runtime
+
+        monkeypatch.setattr(importlib, "import_module", lambda name: types_mod.SimpleNamespace())
+
+        def which(name: str) -> str | None:
+            return f"/usr/bin/{name}" if name in ("gcc", "cc", "g++", "c++") else None
+
+        import shutil
+
+        monkeypatch.setattr(shutil, "which", which)
+        assert runtime._missing_compile_toolchain(using_cuda=True) == []
+        assert runtime._missing_compile_toolchain(using_cuda=False) == []

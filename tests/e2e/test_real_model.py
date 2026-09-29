@@ -181,7 +181,39 @@ async def test_transcribe_tts_output_roundtrip(combined_client) -> None:
     events = await _read_until(c, "transcript", "error")
     assert not any(e.type == "error" for e in events), events
     transcript = Transcript.from_event(events[-1])
-    assert transcript.text.strip()
     lowered = transcript.text.lower()
     for word in ("living", "room", "lamp"):
         assert word in lowered, transcript.text
+
+
+async def test_transcribe_non_multiple_mel_length(combined_client) -> None:
+    """Regression: 3.08 s of 24 kHz audio resamples to 49280 samples = 308
+    mel frames, which the native encoder rejects unless the feature extractor
+    pads to a multiple of 2*n_window (deployed failure: "padded_feature_length
+    ... multiple of `n_window * 2` (100), but got 308")."""
+    c, svc, _ = combined_client
+    await c.write_event(
+        Synthesize(
+            text="The living room lamp is on.",
+            voice=SynthesizeVoice(name=svc.speakers()[0].id),
+        ).event()
+    )
+    events = await _read_until(c, "audio-stop")
+    audio = b"".join(AudioChunk.from_event(e).audio for e in events if AudioChunk.is_type(e.type))
+    # exactly 3.08 s at 24 kHz -> 308 mel frames at 16 kHz; pad with silence
+    # if the synthesis came out shorter (the frame count is what matters)
+    target = 73920 * 2
+    trimmed = audio[:target]
+    if len(trimmed) < target:
+        trimmed += b"\x00" * (target - len(trimmed))
+    assert len(trimmed) == target
+
+    await c.write_event(Transcribe(language="en").event())
+    await c.write_event(AudioStart(rate=24000, width=2, channels=1).event())
+    for offset in range(0, len(trimmed), 16384):
+        chunk = trimmed[offset : offset + 16384]
+        await c.write_event(AudioChunk(rate=24000, width=2, channels=1, audio=chunk).event())
+    await c.write_event(AudioStop().event())
+    events = await _read_until(c, "transcript", "error")
+    assert not any(e.type == "error" for e in events), events
+    assert Transcript.from_event(events[-1]).text is not None

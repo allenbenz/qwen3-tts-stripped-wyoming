@@ -18,12 +18,14 @@ from safetensors.torch import load_file, save_file
 
 from qwen3_tts_stripped_wyoming.convert import (
     ConversionError,
+    asr_needs_migration,
     build_closure_keep_set,
     bytes_to_unicode,
     convert_to_lite,
     convert_to_q8,
     directory_size,
     ensure_variant,
+    migrate_asr_for_transformers5,
     read_model_info,
 )
 
@@ -89,6 +91,48 @@ def _write_source(root: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    return model
+
+
+def _write_asr_source(root: Path) -> Path:
+    """Miniature 4.57-era qwen-asr checkpoint (thinker_config nesting)."""
+    model = root / "asr-src"
+    model.mkdir(parents=True)
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_asr",
+                "thinker_config": {
+                    "audio_config": {"num_mel_bins": 128, "n_window": 50},
+                    "text_config": {"vocab_size": 100},
+                    "audio_token_id": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    tensors = {
+        "thinker.lm_head.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+        "thinker.model.layers.0.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+        "thinker.audio_tower.proj1.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+        "thinker.audio_tower.proj2.weight": torch.randn(4, 4, dtype=torch.bfloat16),
+        "thinker.audio_tower.conv.weight": torch.randn(4, 4, 3, dtype=torch.bfloat16),
+    }
+    save_file(tensors, str(model / "model.safetensors"))
+    (model / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "feature_extractor_type": "WhisperFeatureExtractor",
+                "feature_size": 128,
+                "hop_length": 160,
+                "n_fft": 400,
+                "n_samples": 480000,
+                "nb_max_frames": 3000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model / "tokenizer_config.json").write_text("{}", encoding="utf-8")
     return model
 
 
@@ -255,3 +299,40 @@ class TestEnsureVariant:
     def test_directory_size(self, source_model: Path) -> None:
         assert directory_size(source_model) > 0
         assert directory_size(source_model.parent / "missing") == 0.0
+
+
+class TestAsrMigration:
+    def test_needs_migration(self, tmp_path: Path) -> None:
+        assert asr_needs_migration(_write_asr_source(tmp_path)) is True
+        assert asr_needs_migration(_write_source(tmp_path)) is False
+
+    def test_migrates_layout(self, tmp_path: Path) -> None:
+        dst = migrate_asr_for_transformers5(_write_asr_source(tmp_path), tmp_path / "out")
+        cfg = json.loads((dst / "config.json").read_text(encoding="utf-8"))
+        assert "thinker_config" not in cfg
+        assert cfg["audio_config"]["model_type"] == "qwen3_asr_encoder"
+        assert cfg["text_config"] == {"vocab_size": 100}
+        assert cfg["audio_token_id"] == 1
+        tensors = load_file(str(dst / "model.safetensors"))
+        assert set(tensors) == {
+            "lm_head.weight",
+            "model.language_model.layers.0.weight",
+            "model.multi_modal_projector.linear_1.weight",
+            "model.multi_modal_projector.linear_2.weight",
+            "model.audio_tower.conv.weight",
+        }
+        # ancillary files are copied verbatim
+        assert (dst / "tokenizer_config.json").is_file()
+
+    def test_rewrites_preprocessor_config(self, tmp_path: Path) -> None:
+        dst = migrate_asr_for_transformers5(_write_asr_source(tmp_path), tmp_path / "out")
+        pre = json.loads((dst / "preprocessor_config.json").read_text(encoding="utf-8"))
+        assert pre["feature_extractor_type"] == "Qwen3ASRFeatureExtractor"
+        assert pre["processor_class"] == "Qwen3ASRProcessor"
+        assert pre["n_window"] == 50
+        assert pre["min_length"] == 8000
+        assert pre["return_attention_mask"] is True
+        assert pre["feature_size"] == 128
+        # stale whisper-only keys are dropped
+        assert "n_samples" not in pre
+        assert "nb_max_frames" not in pre

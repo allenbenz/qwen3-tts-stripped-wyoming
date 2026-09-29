@@ -73,8 +73,11 @@ jobs:
           # is durable and large enough to hold the ~3 GB CUDA base layers,
           # which the 10 GB-capped gha cache evicts aggressively. Note RUN
           # --mount=type=cache dirs are not exported by either backend; the
-          # expensive uv sync layer is covered by layer cache instead, keyed
-          # on pyproject.toml + uv.lock (copied before src/ in the Dockerfile).
+          # expensive uv sync layer is covered by layer cache instead. The
+          # Dockerfile splits the runtime venv into a multi-GB third-party
+          # layer (keyed on pyproject.toml + uv.lock) and a few-KB project
+          # layer, so code-only pushes transfer just the small layer: the
+          # torch/CUDA layer digest is unchanged and GHCR dedups it.
           cache-from: |
             type=registry,ref=ghcr.io/${{ steps.repo.outputs.name }}:buildcache
             type=gha

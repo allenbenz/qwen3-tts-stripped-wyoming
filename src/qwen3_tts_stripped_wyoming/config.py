@@ -486,9 +486,9 @@ def build_arg_parser(env: Mapping[str, str] | None = None) -> argparse.ArgumentP
         help=(
             "torch.compile the per-step decoder stacks (talker + code predictor) "
             "with Inductor/Triton. First inference compiles -- minutes, cached "
-            "under TORCHINDUCTOR_CACHE_DIR afterwards. Needs a C compiler at "
-            "runtime (the Docker image ships gcc; venv users need one in PATH) "
-            "(env QWEN3TTS_COMPILE)"
+            "under TORCHINDUCTOR_CACHE_DIR afterwards. Needs a C/C++ compiler "
+            "and, on CUDA, the triton package at runtime (the Docker image "
+            "ships neither and falls back to eager) (env QWEN3TTS_COMPILE)"
         ),
     )
     parser.add_argument(
