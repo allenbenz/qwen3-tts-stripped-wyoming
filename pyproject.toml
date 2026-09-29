@@ -18,24 +18,25 @@ dependencies = [
     "wyoming>=1.10,<2",
     "numpy>=1.26",
     "huggingface-hub>=0.30",
-    # qwen-tts pins transformers==4.57.3 / accelerate==1.12.0 exactly and pulls
-    # torchaudio (+ torch), soundfile, librosa, sox, onnxruntime, einops, gradio.
-    "qwen-tts>=0.1",
-    # qwen-asr (STT side of the server) pins transformers==4.57.6; the two
-    # qwen packages cannot agree, so transformers is overridden to qwen-tts's
-    # 4.57.3 below (patch-level difference, validated by the e2e suites).
+    # The fast TTS backend. faster-qwen3-tts wraps qwen-tts models with a
+    # static-KV-cache + CUDA-graph decode path (real-time RTF, streaming
+    # output). It installs `qwen-tts-hf`, a Transformers-5 compatibility build
+    # of upstream qwen-tts that provides the SAME `qwen_tts` package -- do not
+    # also install upstream `qwen-tts`.
+    "faster-qwen3-tts>=0.1",
+    "qwen-tts-hf>=0.1",
+    # qwen-asr (STT side of the server) still pins transformers==4.57.6 while
+    # qwen-tts-hf needs Transformers 5; the override below forces the newer
+    # line (qwen-asr's modeling is validated by the e2e suite).
     "qwen-asr>=0.0.6",
-    "accelerate==1.12.0",
     "safetensors>=0.4",
 ]
 
 [tool.uv]
-# qwen-tts==0.1.1 requires transformers==4.57.3 while qwen-asr==0.0.6
-# requires transformers==4.57.6; both are patch releases of the same minor and
-# work with 4.57.3 in practice (the TTS modeling code is vendored inside
-# qwen-tts, and qwen-asr's usage is validated by tests/e2e). If the ASR e2e
-# breaks after a qwen-asr upgrade, revisit this override.
-override-dependencies = ["transformers==4.57.3"]
+# qwen-asr==0.0.6 requires transformers==4.57.6 while qwen-tts-hf (the
+# transformers-5 build of qwen-tts) requires a 5.x line; the override pins the
+# 5.x line everywhere. If the ASR e2e breaks after an upgrade, revisit this.
+override-dependencies = ["transformers>=5,<6"]
 
 [project.scripts]
 qwen3-tts-stripped-wyoming = "qwen3_tts_stripped_wyoming.__main__:run"
@@ -84,6 +85,7 @@ module = [
     "wyoming.*",
     "qwen_tts.*",
     "qwen_asr.*",
+    "faster_qwen3_tts.*",
     "transformers.*",
     "torch.*",
     "torch.nn.*",

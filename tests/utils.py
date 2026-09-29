@@ -29,6 +29,7 @@ def make_fake_service(
     speakers: tuple[str, ...] = ("narrator", "aiden"),
     languages: tuple[str, ...] = ("english", "chinese", "german"),
     variant: str = "q8",
+    backend: str = "stock",
 ) -> SynthesisService:
     """A SynthesisService around a fake model (no network, no GPU)."""
     speaker_specs = tuple(Speaker(id=name, languages=languages) for name in speakers)
@@ -40,6 +41,7 @@ def make_fake_service(
         speakers=speaker_specs,
         languages=languages,
         using_cuda=False,
+        backend=backend,
     )
 
 

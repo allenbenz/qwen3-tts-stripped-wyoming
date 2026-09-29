@@ -24,12 +24,7 @@ def fake_audio_piece(
 
 
 class FakeQwenModel:
-    """Minimal stand-in for Qwen3TTSModel covering the surface we call.
-
-    ``generate_custom_voice`` records requests and returns one piece of
-    deterministic audio (two pieces worth of samples when the text is longer
-    than 40 chars), mimicking the (wavs, sr) return shape.
-    """
+    """Minimal stand-in for the stock TTS model (one-shot generation)."""
 
     def __init__(self, sample_rate: int = FAKE_SAMPLE_RATE) -> None:
         self.requests: list[dict[str, Any]] = []
@@ -60,6 +55,50 @@ class FakeQwenModel:
         count = 2 if text and len(text) > 40 else 1
         wav = np.concatenate([piece] * count)
         return [wav], self._sample_rate
+
+
+class FakeFastModel:
+    """Minimal stand-in for FasterQwen3TTS (streaming generation).
+
+    Streams the deterministic sine piece in ``pieces`` chunks, recording
+    requests like the real wrapper's generate_custom_voice_streaming.
+    """
+
+    def __init__(self, pieces: int = 3, sample_rate: int = FAKE_SAMPLE_RATE) -> None:
+        self.requests: list[dict[str, Any]] = []
+        self._pieces = pieces
+        self._sample_rate = sample_rate
+        self.fail: Exception | None = None
+        self.warmup_calls: list[int] = []
+
+    def warmup(self, prefill_len: int = 100) -> None:
+        self.warmup_calls.append(prefill_len)
+
+    def generate_custom_voice_streaming(
+        self,
+        *,
+        text: str,
+        speaker: str,
+        language: str = "Auto",
+        instruct: str | None = None,
+        chunk_size: int = 8,
+        **kwargs: Any,
+    ):
+        if self.fail is not None:
+            raise self.fail
+        self.requests.append(
+            {
+                "text": text,
+                "speaker": speaker,
+                "language": language,
+                "instruct": instruct,
+                "chunk_size": chunk_size,
+                **kwargs,
+            }
+        )
+        piece = fake_audio_piece(self._sample_rate)
+        for _ in range(self._pieces):
+            yield piece, self._sample_rate, {}
 
 
 class FakeAsrModel:

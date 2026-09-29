@@ -24,7 +24,8 @@ VALID_DOWNLOAD_MODES = ("auto", "always", "never")
 VALID_DEVICES = ("auto", "cuda", "cpu")
 VALID_DTYPES = ("auto", "bfloat16", "float16", "float32")
 VALID_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
-VALID_COMPILE_MODES = ("default", "reduce-overhead", "max-autotune")
+VALID_COMPILE_MODES = ("default", "max-autotune")
+VALID_TTS_BACKENDS = ("fast", "stock")
 
 DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 
@@ -64,6 +65,8 @@ class Settings:
     asr_language: str | None = None
     asr_max_new_tokens: int | None = None
     asr_context: bool = True
+    tts_backend: str = "fast"
+    stream_chunk_steps: int = 8
     compile: bool = False
     compile_mode: str = "default"
     compile_dynamic: bool = True
@@ -105,6 +108,14 @@ class Settings:
         if self.compile_mode not in VALID_COMPILE_MODES:
             raise ValueError(
                 f"compile_mode must be one of {VALID_COMPILE_MODES}, got {self.compile_mode!r}"
+            )
+        if self.tts_backend not in VALID_TTS_BACKENDS:
+            raise ValueError(
+                f"tts_backend must be one of {VALID_TTS_BACKENDS}, got {self.tts_backend!r}"
+            )
+        if not 1 <= self.stream_chunk_steps <= 64:
+            raise ValueError(
+                f"stream_chunk_steps must be between 1 and 64, got {self.stream_chunk_steps}"
             )
         if self.output_chunk_ms < MIN_OUTPUT_CHUNK_MS:
             raise ValueError(
@@ -209,6 +220,10 @@ def settings_from_env(env: Mapping[str, str] | None = None) -> Settings:
         kwargs["asr_max_new_tokens"] = count
     if (flag := _env_bool(source, "ASR_CONTEXT")) is not None:
         kwargs["asr_context"] = flag
+    if text := _raw(source, "TTS_BACKEND"):
+        kwargs["tts_backend"] = text.lower()
+    if (count := _env_int(source, "STREAM_CHUNK_STEPS")) is not None:
+        kwargs["stream_chunk_steps"] = count
     if (flag := _env_bool(source, "COMPILE")) is not None:
         kwargs["compile"] = flag
     if text := _raw(source, "COMPILE_MODE"):
@@ -442,6 +457,29 @@ def build_arg_parser(env: Mapping[str, str] | None = None) -> argparse.ArgumentP
         "(env QWEN3TTS_ASR_CONTEXT)",
     )
     parser.add_argument(
+        "--tts-backend",
+        dest="tts_backend",
+        choices=VALID_TTS_BACKENDS,
+        default=base.tts_backend,
+        help=(
+            "TTS inference backend: fast (faster-qwen3-tts: static KV cache + "
+            "CUDA graphs, streaming output, ~3x faster) or stock (the qwen-tts "
+            "eager path, one-shot audio) (env QWEN3TTS_TTS_BACKEND)"
+        ),
+    )
+    parser.add_argument(
+        "--stream-chunk-steps",
+        dest="stream_chunk_steps",
+        type=int,
+        default=base.stream_chunk_steps,
+        metavar="N",
+        help=(
+            "fast backend only: decode steps per streamed audio chunk "
+            "(1-64). 8 steps = ~640ms of audio per chunk; smaller = lower "
+            "latency, slightly more overhead (env QWEN3TTS_STREAM_CHUNK_STEPS)"
+        ),
+    )
+    parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
         default=base.compile,
@@ -459,10 +497,11 @@ def build_arg_parser(env: Mapping[str, str] | None = None) -> argparse.ArgumentP
         choices=VALID_COMPILE_MODES,
         default=base.compile_mode,
         help=(
-            "torch.compile mode: default (fusion only, safest), "
-            "reduce-overhead (adds CUDA graphs; may not engage with the growing "
-            "KV cache), max-autotune (longest compile) "
-            "(env QWEN3TTS_COMPILE_MODE)"
+            "torch.compile mode: default (fusion only, safest) or "
+            "max-autotune (longest compile; GEMM autotuning auto-disables on "
+            "GPUs with < 68 SMs). reduce-overhead is NOT supported: qwen-tts "
+            "grows its KV cache with torch.cat from eager code, which CUDA "
+            "graph replay overwrites (env QWEN3TTS_COMPILE_MODE)"
         ),
     )
     parser.add_argument(

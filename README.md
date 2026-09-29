@@ -1,6 +1,6 @@
 # qwen3-tts-stripped-wyoming
 
-A [Wyoming](https://github.com/rhasspy/wyoming)-protocol server for **Qwen3-TTS CustomVoice models** and **Qwen3-ASR speech recognition** — text-to-speech and speech-to-text on one port for Home Assistant. TTS serves the stock checkpoints, community finetunes (e.g. [scrappylabs/narrator-tts](https://huggingface.co/scrappylabs/narrator-tts)), or size-optimized "stripped" conversions of either; audio is emitted as 16-bit PCM at 24 kHz mono. STT transcribes `transcribe` requests with [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) (30 languages, auto language detection). Inference runs on CPU or NVIDIA GPU via **PyTorch** (`qwen-tts` / `qwen-asr`).
+A [Wyoming](https://github.com/rhasspy/wyoming)-protocol server for **Qwen3-TTS CustomVoice models** and **Qwen3-ASR speech recognition** — text-to-speech and speech-to-text on one port for Home Assistant. TTS runs on the [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts) engine by default (static KV cache + CUDA graphs: **faster than real time, with streaming audio** — measured RTF 0.51–0.55 on an RTX 3090 vs 1.7 for the stock eager path), serving stock checkpoints, community finetunes (e.g. [scrappylabs/narrator-tts](https://huggingface.co/scrappylabs/narrator-tts)), or size-optimized "stripped" conversions of either. STT transcribes `transcribe` requests with [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) (30 languages, auto language detection) on the native Transformers 5 stack. The stock qwen-tts eager backend (`--tts-backend stock`) remains available as a fallback and for CPU.
 
 The server serves any of three checkpoint variants and can convert between them on first start (see [Variants](#variants)):
 
@@ -14,8 +14,8 @@ The server serves any of three checkpoint variants and can convert between them 
 
 - Answers Wyoming `describe` and `ping` requests so Home Assistant can discover the server and its voices (one voice per model speaker: `aiden`, `serena`, … or `narrator` for the finetune).
 - Handles both one-shot `synthesize` and streaming `synthesize-start` / `synthesize-chunk` / `synthesize-stop` requests (text is buffered; synthesis runs once on stop).
-- Emits `audio-start`, `audio-chunk`, and `audio-stop` events carrying 16-bit PCM at 24 kHz mono.
-- **STT**: handles `transcribe` → `audio-start` / `audio-chunk`+ / `audio-stop` and replies with a `transcript` event. Language is taken from the request (BCP-47) or auto-detected; `transcript_names` / `transcript_terms` are forwarded as recognition bias context. Any input sample rate works (audio is resampled to 16 kHz).
+- **Fast TTS backend (default): streams `audio-chunk` events while generating** — time to first audio ≈ 0.5–1 s instead of full-utterance latency. The stock backend synthesizes the whole clip and then chunks it (24 kHz 16-bit mono either way).
+- **STT**: handles `transcribe` → `audio-start` / `audio-chunk`+ / `audio-stop` and replies with a `transcript` event. Language is taken from the request (BCP-47) or auto-detected; `transcript_names` / `transcript_terms` are forwarded as recognition bias context. Any input sample rate works (audio is resampled to 16 kHz). 4.57-era qwen-asr checkpoints are migrated to the Transformers-5 layout automatically (cached beside the download).
 - Serializes all model work (synthesis and transcription) across connections with one lock: the models share the GPU, and a voice pipeline is half-duplex anyway.
 - TTS language is mapped per request from Home Assistant (`en`, `en-US`, `zh`, `de`, …) to the model's language ids; when no language is given the model auto-detects (`Auto`).
 
@@ -65,19 +65,22 @@ Only `custom_voice` models are convertible: Base (voice-clone) models need the s
 
 ## Performance
 
-Measured on an RTX 3090 (bf16, ~7.5 s of audio per request, eager inference):
+Measured on an RTX 3090 (bf16, ~3 s of audio per request):
 
-| Configuration | Real-time factor | Notes |
-| --- | --- | --- |
-| `lite` (bf16) | 1.7x | baseline; fastest |
-| `q8` | 2.3x | int8 → fp32 → bf16 on every decode step; ~1.5 GB less VRAM, 2.4 GB on disk |
+| Backend / variant | Real-time factor | Time to first audio | Notes |
+| --- | --- | --- | --- |
+| **fast + bf16** | **0.51x** | **~0.5 s** | faster-qwen3-tts (static KV cache + CUDA graphs), streams while generating |
+| **fast + lite** | **0.55x** | ~0.75 s | same, with the pruned-vocab + ST-lite conversion |
+| fast + q8 | 1.31x | ~1.1 s | Q8Linear dequant inside the graph; prefer lite |
+| stock + lite (bf16) | 1.7x | full utterance | eager qwen-tts; one-shot audio |
+| stock + q8 | 2.3x | full utterance | int8 → fp32 → bf16 per decode step; ~1.5 GB less VRAM |
 
 Notes:
 
-- **torch.compile / Triton (experimental, opt-in via `QWEN3TTS_COMPILE=1`; enabled by default in the Docker image).** Because decode is launch-bound (see below), Inductor fusion is the one remaining speed lever. The server compiles the talker and code-predictor stacks at first inference (`mode=default`, `dynamic=True`; both configurable) and caches the artifacts under `/data/compile-cache` in Docker, so the multi-minute compile happens once per model, not per container. Measured on CPU (podman, 8 cores): the full path compiles and synthesizes correctly; expect ~1.5–2.5x on GPU, but treat it as an experiment — if anything misbehaves set `QWEN3TTS_COMPILE=0`. Inductor needs a C/C++ compiler at runtime (the image ships `gcc`+`g++`; venv users need them in PATH — the server checks and falls back to eager with a clear log line when missing).
-- **The `flash-attn is not installed` warning is noise.** It is printed unconditionally at import time by the (unused) 25 Hz tokenizer's whisper encoder. The talker, 12 Hz speech tokenizer, and ASR all resolve to **SDPA** attention (`sdpa` in the startup logs), which at these sequence lengths (~100 tokens) is within noise of flash-attn. Installing flash-attn is not worth pinning a torch-2.14-matching wheel for.
-- The remaining gap to real time is the qwen-tts eager stack itself: per audio frame it runs one 28-layer talker step plus 15 small code-predictor steps, so decode is kernel-launch-bound rather than attention- or bandwidth-bound. `torch.compile` would help but pulls Triton JIT (compiler in the image) — deliberately out of scope.
-- Rule of thumb: `lite` when speed matters (bit-exact and fastest); `q8` when VRAM or disk is the constraint (~35% slower for ~1.5 GB less VRAM and a 2.4 GB payload). Materializing q8 weights to bf16 at load time would just recreate `lite`'s runtime, so no such option exists.
+- **Variant guidance for the fast backend: use `lite`** — smaller than bf16 on disk, faster than q8, and bit-exact vs the source. `q8` still works (patches survive CUDA-graph capture) but per-step dequant costs more than it saves on GPU.
+- **The `flash-attn is not installed` warning is noise** — printed unconditionally at import time by the (unused) 25 Hz tokenizer's whisper encoder; attention resolves to SDPA.
+- The stock backend's gap to real time is the qwen-tts eager stack: per frame it runs one 28-layer talker step plus 15 code-predictor steps, so decode is kernel-launch-bound (GPU >95% idle). `torch.compile` (`QWEN3TTS_COMPILE=1`, stock only) fuses some of it; the fast backend eliminates the problem by capturing whole steps as CUDA graphs.
+- **`reduce-overhead` compile mode is not supported on stock**: qwen-tts grows its KV cache with `torch.cat` from eager code, which CUDA-graph replay overwrites. The fast backend's preallocated static cache is exactly the fix.
 
 ## Docker
 
@@ -117,7 +120,7 @@ Voice and language are chosen **per request** from Home Assistant — they are n
 
 ## Configuration
 
-Every setting is available as an environment variable and as a CLI flag of the same meaning (`--uri`, `--model`, `--model-dir`, `--variant`, `--convert`, `--keep-set`, `--st-dtype`, `--q8-group`, `--download`, `--revision`, `--device`, `--dtype`, `--voice`, `--language`, `--instruct`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--max-new-tokens`, `--seed`, `--output-chunk-ms`, `--energy-gain`, `--warmup`, `--asr-model`, `--asr-language`, `--asr-max-new-tokens`, `--asr-context`, `--log-level`). CLI flags override environment variables.
+Every setting is available as an environment variable and as a CLI flag of the same meaning (`--uri`, `--model`, `--model-dir`, `--variant`, `--convert`, `--keep-set`, `--st-dtype`, `--q8-group`, `--download`, `--revision`, `--device`, `--dtype`, `--voice`, `--language`, `--instruct`, `--temperature`, `--top-k`, `--top-p`, `--repetition-penalty`, `--max-new-tokens`, `--seed`, `--output-chunk-ms`, `--energy-gain`, `--warmup`, `--tts-backend`, `--stream-chunk-steps`, `--asr-model`, `--asr-language`, `--asr-max-new-tokens`, `--asr-context`, `--compile`, `--compile-mode`, `--compile-dynamic`, `--log-level`). CLI flags override environment variables.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -129,8 +132,10 @@ Every setting is available as an environment variable and as a CLI flag of the s
 | `QWEN3TTS_KEEP_SET` | `latin` | Vocabulary keep-set when converting (`latin` or `ml`) |
 | `QWEN3TTS_ST_DTYPE` | `float16` | Speech-tokenizer decoder storage dtype when converting |
 | `QWEN3TTS_Q8_GROUP` | `64` | Inputs per int8 scale group when converting to q8 |
-| `QWEN3TTS_COMPILE` | `false` (`true` in the Docker image) | torch.compile the per-step decoder stacks (Inductor/Triton); first inference compiles — minutes, then cached. Needs `gcc` (CUDA/Triton) or `g++` (CPU) at runtime |
-| `QWEN3TTS_COMPILE_MODE` | `default` | `default` (fusion only, safest), `reduce-overhead` (adds CUDA graphs; may not engage with the growing KV cache), `max-autotune` (longest compile) |
+| `QWEN3TTS_TTS_BACKEND` | `fast` | `fast` (faster-qwen3-tts: static KV cache + CUDA graphs + streaming, needs CUDA) or `stock` (eager qwen-tts, CPU-capable) |
+| `QWEN3TTS_STREAM_CHUNK_STEPS` | `8` | fast backend: decode steps per streamed audio chunk (1–64); 8 ≈ 640 ms — smaller = lower latency, slightly more overhead |
+| `QWEN3TTS_COMPILE` | `false` (`true` in the Docker image) | stock backend only: torch.compile the decoder stacks; first inference compiles — minutes, then cached |
+| `QWEN3TTS_COMPILE_MODE` | `default` | `default` (fusion only, safest) or `max-autotune` (longest compile; GEMM autotuning auto-disables below 68 SMs). **`reduce-overhead` is not supported** — qwen-tts's dynamic KV cache (`torch.cat` growth from eager code) is incompatible with CUDA-graph replay |
 | `QWEN3TTS_COMPILE_DYNAMIC` | `true` | Compile with dynamic shapes so growing decode lengths don't recompile per step |
 | `QWEN3TTS_DOWNLOAD` | `auto` | `auto` downloads when missing, `always` re-downloads at startup, `never` fails if missing |
 | `QWEN3TTS_REVISION` | *(empty)* | Hugging Face revision to pin |
@@ -188,19 +193,26 @@ a no-op.) **`uv run` re-syncs the venv to the lockfile and would revert this**
 directly. The Docker image gets CUDA torch from the linux wheels
 automatically.
 
-### The transformers pin (qwen-tts vs qwen-asr)
+### Dependency stack (Transformers 5, faster-qwen3-tts, native ASR)
 
-`qwen-tts` pins `transformers==4.57.3` while `qwen-asr` pins `==4.57.6` — two
-patch releases of the same minor that cannot be satisfied together. This
-project forces `4.57.3` via `[tool.uv] override-dependencies` (qwen-tts's pin
-wins; both qwen packages vendor their own modeling code, and the e2e suites
-exercise both models in one process). If an ASR e2e test breaks after a
-qwen-asr upgrade, revisit the override.
+The fast TTS backend uses [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts),
+which depends on `qwen-tts-hf` — a Transformers-5 compatibility build that
+provides the same `qwen_tts` package as upstream (never install both). This
+forced the environment to Transformers 5, which the `qwen-asr` package (pinned
+to 4.57) does not fully support: the server keeps a small import shim
+(`patches/asr.py`) but runs **inference on the native Transformers-5 Qwen3ASR
+classes**, migrating 4.57-era checkpoints automatically
+(`converted ...-tf5` directories appear beside downloads; see
+`convert.migrate_asr_for_transformers5`). `qwen-asr` remains a dependency for
+its utilities and language list. `[tool.uv] override-dependencies` pins
+`transformers>=5,<6` against qwen-asr's 4.57 pin; if the ASR e2e roundtrip
+breaks after an upgrade, revisit the migration.
 
 ## Troubleshooting
 
 - **First start is slow** — the TTS source is downloaded (~4.5 GB for 1.7B) and converted when `--variant` selects a converted variant (minutes, CPU), plus the ASR model (~1.5 GB). All cached under `--model-dir`. With `QWEN3TTS_COMPILE=1`, the first synthesis additionally compiles (minutes) and caches under `/data/compile-cache` (Docker) — make sure `/data` is a volume so the cache survives restarts.
 - **`torch.compile` requests fail with `InvalidCxxCompiler` / `Failed to find C compiler`** — the runtime toolchain is missing (`gcc` for CUDA/Triton, `g++` for CPU Inductor). The Docker image ships both; the server detects a missing toolchain at load and falls back to eager with a log line. In a venv, install a C/C++ compiler or set `QWEN3TTS_COMPILE=0`.
+- **`RuntimeError: accessing tensor output of CUDAGraphs that has been overwritten` (stock backend)** — `QWEN3TTS_COMPILE_MODE=reduce-overhead` is incompatible with qwen-tts's dynamic KV cache and is rejected at startup; use `default`/`max-autotune`, or better the fast backend (its preallocated static cache is exactly the fix). As a safety net, a failed compiled warmup reverts to eager modules.
 - **GPU not used** — check startup logs; `device=cuda` fails fast with the reason, `auto` falls back to CPU (CPU-only torch build on Windows is the usual cause).
 - **Voice list missing speakers** — voices come from `config.json → talker_config.spk_id`; finetunes that add speakers appear automatically.
 - **Non-English text sounds wrong on a latin keep-set** — convert with `--keep-set ml` (Chinese/Japanese/Korean/Russian need the bigger keep-set); the server also logs a warning when input tokens fall outside the keep-set.

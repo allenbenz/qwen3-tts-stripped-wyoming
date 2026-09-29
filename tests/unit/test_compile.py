@@ -22,13 +22,22 @@ class TestCompileSettings:
         settings = settings_from_env(
             {
                 "QWEN3TTS_COMPILE": "1",
-                "QWEN3TTS_COMPILE_MODE": "reduce-overhead",
+                "QWEN3TTS_COMPILE_MODE": "max-autotune",
                 "QWEN3TTS_COMPILE_DYNAMIC": "false",
             }
         )
         assert settings.compile is True
-        assert settings.compile_mode == "reduce-overhead"
+        assert settings.compile_mode == "max-autotune"
         assert settings.compile_dynamic is False
+
+    def test_reduce_overhead_rejected(self) -> None:
+        """reduce-overhead (CUDA graphs) is incompatible with qwen-tts's
+        DynamicCache (torch.cat KV growth from eager code) and is rejected at
+        config validation, before any model loads."""
+        from qwen3_tts_stripped_wyoming.config import settings_from_env
+
+        with pytest.raises(ValueError, match="compile_mode"):
+            settings_from_env({"QWEN3TTS_COMPILE_MODE": "reduce-overhead"})
 
     def test_invalid_mode(self) -> None:
         from qwen3_tts_stripped_wyoming.config import settings_from_env
@@ -102,3 +111,39 @@ class TestApplyTorchCompile:
         assert runtime.apply_torch_compile(tts_model, mode="default", dynamic=True) == [
             "talker.model"
         ]
+
+
+class TestRevertTorchCompile:
+    def test_revert_restores_original_modules(self, monkeypatch) -> None:
+        """apply -> revert must leave exactly the original module objects in
+        place (the warmup-failure fallback path depends on this)."""
+        import torch
+
+        from qwen3_tts_stripped_wyoming import runtime
+
+        class FakeOptimized:
+            def __init__(self, module: object) -> None:
+                self._orig_mod = module
+
+        monkeypatch.setattr(torch, "compile", lambda m, **k: FakeOptimized(m))
+
+        talker_inner = types.SimpleNamespace()
+        predictor_inner = types.SimpleNamespace()
+        predictor = types.SimpleNamespace(model=predictor_inner)
+        talker = types.SimpleNamespace(model=talker_inner, code_predictor=predictor)
+        tts_model = types.SimpleNamespace(talker=talker)
+
+        runtime.apply_torch_compile(tts_model, mode="default", dynamic=True)
+        assert talker.model is not talker_inner
+
+        restored = runtime.revert_torch_compile(tts_model)
+        assert restored == 2
+        assert talker.model is talker_inner
+        assert predictor.model is predictor_inner
+
+    def test_revert_without_compile_is_noop(self) -> None:
+        from qwen3_tts_stripped_wyoming import runtime
+
+        talker = types.SimpleNamespace(model=types.SimpleNamespace())
+        tts_model = types.SimpleNamespace(talker=talker)
+        assert runtime.revert_torch_compile(tts_model) == 0

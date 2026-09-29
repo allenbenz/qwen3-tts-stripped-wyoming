@@ -235,21 +235,22 @@ class Qwen3TtsEventHandler(AsyncEventHandler):
             )
             gain = self._settings.energy_gain
             try:
-                # one-shot synthesis; the audio is chunked on the way out
-                audio = await self._service.synthesize(
+                # fast backend: audio pieces stream out during generation;
+                # stock backend: one piece after full synthesis
+                async for piece in self._service.stream(
                     text=text, speaker_id=speaker.id, language=language
-                )
-                data = float_to_int16_bytes(audio, gain=gain)
-                for part in split_bytes(data, chunk_bytes):
-                    await self.write_event(
-                        AudioChunk(
-                            rate=self._service.sample_rate,
-                            width=SAMPLE_WIDTH,
-                            channels=CHANNELS,
-                            audio=part,
-                            timestamp=_elapsed_ms(started),
-                        ).event()
-                    )
+                ):
+                    data = float_to_int16_bytes(piece, gain=gain)
+                    for part in split_bytes(data, chunk_bytes):
+                        await self.write_event(
+                            AudioChunk(
+                                rate=self._service.sample_rate,
+                                width=SAMPLE_WIDTH,
+                                channels=CHANNELS,
+                                audio=part,
+                                timestamp=_elapsed_ms(started),
+                            ).event()
+                        )
                 await self.write_event(AudioStop(timestamp=_elapsed_ms(started)).event())
             except VoiceResolutionError as exc:
                 await self._write_error(str(exc), code="invalid-request")

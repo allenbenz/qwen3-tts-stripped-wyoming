@@ -59,9 +59,9 @@ ENV PATH="/app/.venv/bin:$PATH" \
     # NOTE: this kill switch only affects the eager torch._native registry --
     # torch.compile/Inductor generates its own Triton kernels independently.
     TORCH_DISABLE_NATIVE_JIT=1 \
-    # torch.compile (Inductor/Triton): enabled by default in the image; the
-    # caches live on the /data volume so the multi-minute first compile
-    # happens once per model, not once per container.
+    # torch.compile (Inductor/Triton) for the stock TTS backend: the caches
+    # live on the /data volume so the multi-minute first compile happens once
+    # per model, not per container. (The default fast backend needs neither.)
     QWEN3TTS_COMPILE=1 \
     TORCHINDUCTOR_CACHE_DIR=/data/compile-cache/inductor \
     TRITON_CACHE_DIR=/data/compile-cache/triton

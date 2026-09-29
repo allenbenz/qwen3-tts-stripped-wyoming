@@ -285,3 +285,35 @@ async def test_synthesis_serialized_across_connections() -> None:
         for c in clients:
             await c.disconnect()
         await server.stop()
+
+
+async def test_fast_backend_streams_multiple_audio_chunks(tmp_path) -> None:
+    """The fast backend must emit audio while generating, not one blob at the
+    end: 3 streamed pieces x (100ms piece / 50ms chunk) = 6 chunks."""
+    from wyoming.tts import Synthesize, SynthesizeVoice
+
+    from qwen3_tts_stripped_wyoming.audio import float_to_int16_bytes
+    from qwen3_tts_stripped_wyoming.config import Settings
+
+    from ..fakes import FakeFastModel, fake_audio_piece
+    from ..utils import connect, make_fake_service, read_until, start_test_server
+
+    model = FakeFastModel(pieces=3)
+    settings = Settings(model_dir=tmp_path, output_chunk_ms=50, stream_chunk_steps=8)
+    service = make_fake_service(model, settings, backend="fast")
+    server, port = await start_test_server(service, settings)
+    client = await connect(port)
+    try:
+        await client.write_event(
+            Synthesize(text="Stream me.", voice=SynthesizeVoice(name="aiden")).event()
+        )
+        events = await read_until(client, "audio-stop")
+        chunks = [e for e in events if AudioChunk.is_type(e.type)]
+        assert len(chunks) == 6
+        assert model.requests[-1]["chunk_size"] == 8
+        audio = b"".join(AudioChunk.from_event(e).audio for e in chunks)
+        expected = np.concatenate([fake_audio_piece()] * 3)
+        assert audio == float_to_int16_bytes(expected)
+    finally:
+        await client.disconnect()
+        await server.stop()

@@ -501,3 +501,83 @@ def directory_size(path: Path) -> float:
     if not path.exists():
         return 0.0
     return sum(p.stat().st_size for p in path.glob("**/*") if p.is_file()) / 1e9
+
+
+# ---------------------------------------------------------------------------
+# ASR migration: 4.57-era qwen-asr checkpoints -> Transformers 5 native layout
+# ---------------------------------------------------------------------------
+
+
+def asr_needs_migration(model_dir: Path) -> bool:
+    """True when the ASR config uses the pre-Transformers-5 nesting."""
+    cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    return "thinker_config" in cfg
+
+
+def migrate_asr_for_transformers5(src: str | Path, dst: str | Path) -> Path:
+    """Materialize a Transformers-5-native copy of a qwen-asr checkpoint.
+
+    The 4.57-era layout nests everything under ``thinker_config`` and prefixes
+    weights with ``thinker.``; the Transformers 5 native model expects
+    ``audio_config``/``text_config`` at the top level and ``model.*`` weight
+    names. This rewrites config + weight keys in place into ``dst``:
+
+      - thinker_config.audio_config -> audio_config   (model_type fixed to
+        ``qwen3_asr_encoder``)
+      - thinker_config.text_config  -> text_config
+      - thinker.model.*      -> model.language_model.*
+      - thinker.audio_tower.proj{1,2}.* -> model.multi_modal_projector.linear_{1,2}.*
+      - thinker.audio_tower.* -> model.audio_tower.*
+      - thinker.lm_head.*     -> lm_head.*
+    """
+    src, dst = Path(src), Path(dst)
+    cfg = json.loads((src / "config.json").read_text(encoding="utf-8"))
+    thinker = cfg.pop("thinker_config")
+    audio = dict(thinker["audio_config"])
+    audio["model_type"] = "qwen3_asr_encoder"
+    cfg["audio_config"] = audio
+    cfg["text_config"] = thinker["text_config"]
+    for key in (
+        "audio_token_id",
+        "audio_start_token_id",
+        "audio_end_token_id",
+        "initializer_range",
+        "tie_word_embeddings",
+    ):
+        if key in thinker:
+            cfg[key] = thinker[key]
+
+    tensors = load_file(str(src / "model.safetensors"), device="cpu")
+    migrated: dict[str, torch.Tensor] = {}
+    for key, value in tensors.items():
+        if key.startswith("thinker.lm_head."):
+            migrated["lm_head" + key[len("thinker.lm_head") :]] = value
+        elif key.startswith("thinker.model."):
+            migrated["model.language_model." + key[len("thinker.model.") :]] = value
+        elif key.startswith("thinker.audio_tower.proj1."):
+            migrated[
+                "model.multi_modal_projector.linear_1." + key.split("thinker.audio_tower.proj1.")[1]
+            ] = value
+        elif key.startswith("thinker.audio_tower.proj2."):
+            migrated[
+                "model.multi_modal_projector.linear_2." + key.split("thinker.audio_tower.proj2.")[1]
+            ] = value
+        elif key.startswith("thinker.audio_tower."):
+            migrated["model.audio_tower." + key[len("thinker.audio_tower.") :]] = value
+        else:
+            migrated[key] = value
+
+    dst.mkdir(parents=True, exist_ok=True)
+    save_file(migrated, str(dst / "model.safetensors"), metadata={"format": "pt"})
+    (dst / "config.json").write_text(
+        json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    for f in src.glob("*"):
+        if f.is_file() and f.name not in (
+            "config.json",
+            "model.safetensors",
+            "model.safetensors.index.json",
+        ):
+            shutil.copy2(f, dst / f.name)
+    _LOGGER.info("asr: migrated %s to Transformers-5 layout at %s", src.name, dst)
+    return dst
