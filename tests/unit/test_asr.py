@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
-from qwen3_tts_stripped_wyoming.asr import LanguageResolutionError, TranscriptionService
+from qwen3_tts_stripped_wyoming.asr import (
+    LanguageResolutionError,
+    TranscriptionService,
+    _NativeAsrWrapper,
+)
 from qwen3_tts_stripped_wyoming.audio import (
     asr_language_to_bcp47,
     bcp47_to_asr_language,
@@ -126,6 +132,114 @@ def test_transcription_service_requires_model(fake_settings) -> None:
     # constructor only wires things; create() validates the source
     service = TranscriptionService(FakeAsrModel(), fake_settings, languages=("English",))
     assert service.languages == ("English",)
+
+
+class TestNativeAsrWrapperParsing:
+    """_parse_output must split on the <asr_text> marker, not whitespace.
+
+    The model emits ``language English<asr_text>First word ...`` with no space
+    before the marker; the old first-space split glued the first transcription
+    word onto the language name and dropped it (deployed symptom: the first
+    spoken word went missing unless a filler word absorbed the loss).
+    """
+
+    def _wrapper(self) -> _NativeAsrWrapper:
+        return _NativeAsrWrapper(
+            model=SimpleNamespace(), processor=SimpleNamespace(), max_new_tokens=None
+        )
+
+    def test_autodetect_keeps_first_word(self) -> None:
+        lang, text = self._wrapper()._parse_output(
+            "language English<asr_text>The living room lamp is on.", None
+        )
+        assert text == "The living room lamp is on."
+        assert lang == "English"
+
+    def test_autodetect_filler_word_not_needed(self) -> None:
+        # the user's workaround: a leading filler word used to be eaten instead
+        lang, text = self._wrapper()._parse_output(
+            "language English<asr_text>Potato turn on the kitchen light", None
+        )
+        assert text == "Potato turn on the kitchen light"
+        assert lang == "English"
+
+    def test_forced_language_output_is_plain_text(self) -> None:
+        lang, text = self._wrapper()._parse_output(
+            "The living room lamp is on.", "English"
+        )
+        assert text == "The living room lamp is on."
+        assert lang == "English"
+
+    def test_no_marker_means_plain_text(self) -> None:
+        lang, text = self._wrapper()._parse_output("hello there", None)
+        assert text == "hello there"
+        assert lang is None
+
+    def test_language_none_is_empty_audio(self) -> None:
+        lang, text = self._wrapper()._parse_output("language None<asr_text>", None)
+        assert text == ""
+        assert lang is None
+
+    def test_multiline_meta(self) -> None:
+        lang, text = self._wrapper()._parse_output(
+            "language English\nnoise<asr_text>hello world", None
+        )
+        assert text == "hello world"
+        assert lang == "English"
+
+    def test_close_tag_stripped(self) -> None:
+        lang, text = self._wrapper()._parse_output(
+            "language English<asr_text>hello world</asr_text>", None
+        )
+        assert text == "hello world"
+        assert lang == "English"
+
+
+class FakeTemplateProcessor:
+    """Renders the same shape as the Qwen3-ASR checkpoint chat template:
+    only system text and audio tokens survive; user-turn text is dropped."""
+
+    def apply_chat_template(self, conversation, *, tokenize: bool, add_generation_prompt: bool):
+        assert tokenize is False
+        system = next(
+            (m["content"] for m in conversation if m["role"] == "system"), ""
+        )
+        audio = any(
+            isinstance(m["content"], list) and any(c.get("type") == "audio" for c in m["content"])
+            for m in conversation
+        )
+        out = f"<|im_start|>system\n{system}<|im_end|>\n"
+        if audio:
+            out += "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
+        if add_generation_prompt:
+            out += "<|im_start|>assistant\n"
+        return out
+
+
+class TestNativeAsrWrapperPrompt:
+    """Context goes to the system message; a forced language is prefilled
+    after the generation prompt (qwen-asr convention)."""
+
+    def _wrapper(self) -> _NativeAsrWrapper:
+        return _NativeAsrWrapper(
+            model=SimpleNamespace(),
+            processor=FakeTemplateProcessor(),
+            max_new_tokens=None,
+        )
+
+    def test_context_reaches_system_message(self) -> None:
+        prompt = self._wrapper()._render_prompt("waveform", "kitchen light, lava lamp", None)
+        assert "<|im_start|>system\nkitchen light, lava lamp<|im_end|>" in prompt
+        assert "language" not in prompt
+        assert prompt.endswith("<|im_start|>assistant\n")
+
+    def test_language_is_prefilled_not_user_text(self) -> None:
+        prompt = self._wrapper()._render_prompt("waveform", "", "English")
+        assert prompt.endswith("<|im_start|>assistant\nlanguage English<asr_text>")
+
+    def test_no_context_renders_empty_system(self) -> None:
+        prompt = self._wrapper()._render_prompt("waveform", "", None)
+        assert "<|im_start|>system\n<|im_end|>" in prompt
 
 
 class TestEnsureNativeFeatureExtractor:

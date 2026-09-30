@@ -308,18 +308,7 @@ class _NativeAsrWrapper:
             x_new = np.linspace(0.0, 1.0, n_out, endpoint=False)
             waveform = np.interp(x_new, x_old, waveform).astype(np.float32)
 
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio", "audio": waveform},
-                    {"type": "text", "text": self._build_prompt(language, context)},
-                ],
-            }
-        ]
-        text = self.processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
+        text = self._render_prompt(waveform, context, language)
         inputs = self.processor(
             text=[text], audio=[waveform], return_tensors="pt", padding=True
         ).to(self.model.device)
@@ -343,29 +332,61 @@ class _NativeAsrWrapper:
             results.append(SimpleNamespace(text=txt, language=lang))
         return results
 
-    def _build_prompt(self, language: str | None, context: str) -> str:
-        parts = []
-        if context:
-            parts.append(context)
+    def _render_prompt(self, audio: Any, context: str, language: str | None) -> str:
+        """Render the prompt the way the qwen-asr package does.
+
+        Context/hotwords belong in the *system* message and the user turn is
+        audio-only: the checkpoint's chat template renders only the system
+        text and the audio tokens, so any text placed in the user turn (an
+        instruction or ``language <Name>``) is silently dropped and the model
+        always auto-detects. A forced language is applied the way qwen-asr
+        does it: append ``language <Name><asr_text>`` after the generation
+        prompt so the model emits transcription text only.
+        """
+        messages = [
+            {"role": "system", "content": context or ""},
+            {"role": "user", "content": [{"type": "audio", "audio": audio}]},
+        ]
+        prompt = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         if language:
-            parts.append(f"language {language}")
-        return " ".join(parts) if parts else "transcribe the audio"
+            prompt += f"language {language}<asr_text>"
+        return prompt
 
     def _parse_output(self, raw: str, requested: str | None) -> tuple[str | None, str]:
-        text = raw
-        lang = requested
-        # qwen-asr output convention: "language <Name> <asr_text> ..."
-        if raw.startswith("language "):
-            rest = raw[len("language ") :].strip()
-            head, _, tail = rest.partition(" ")
-            candidate = head.strip().lower().capitalize()
-            if candidate in _SUPPORTED_LANGUAGES:
-                lang = candidate
-            # strip the asr_text wrapper the model emits
-            tail = tail.strip()
-            if tail.startswith("<asr_text>"):
-                tail = tail[len("<asr_text>") :]
-            if tail.endswith("</asr_text>"):
-                tail = tail[: -len("</asr_text>")]
-            text = tail.strip()
-        return lang, text
+        """Parse ``language <Name><asr_text>transcription`` (qwen-asr convention).
+
+        The marker glues directly to the language name with no space
+        (``language English<asr_text>Hello``), so parsing must split on the
+        ``<asr_text>`` marker first: splitting on whitespace merges the first
+        transcription word into the language name and drops it from the
+        transcript. With a forced language the model continues after the
+        prefilled marker, so the raw output is already plain transcription.
+        """
+        text = str(raw).strip()
+        if requested:
+            return requested, text
+        if not text:
+            return None, ""
+        meta, marker, tail = text.partition("<asr_text>")
+        transcription = tail.strip() if marker else text
+        if transcription.endswith("</asr_text>"):
+            transcription = transcription[: -len("</asr_text>")].strip()
+        if not marker:
+            return None, transcription
+        meta = meta.strip()
+        if not meta or "language none" in meta.lower():
+            # empty-audio heuristic from the qwen-asr package
+            return None, transcription
+        lang = None
+        for line in meta.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.lower().startswith("language "):
+                name = line[len("language ") :].strip()
+                canonical = name.lower().capitalize()
+                lang = canonical if canonical in _SUPPORTED_LANGUAGES else (name or None)
+            break  # only the first non-empty meta line carries the language
+        return lang, transcription

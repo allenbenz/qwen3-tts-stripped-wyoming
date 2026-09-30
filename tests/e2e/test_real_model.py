@@ -182,7 +182,9 @@ async def test_transcribe_tts_output_roundtrip(combined_client) -> None:
     assert not any(e.type == "error" for e in events), events
     transcript = Transcript.from_event(events[-1])
     lowered = transcript.text.lower()
-    for word in ("living", "room", "lamp"):
+    # "the" pins the first-word regression: the old parser split the model
+    # output on the first space and swallowed the first transcription word
+    for word in ("the", "living", "room", "lamp"):
         assert word in lowered, transcript.text
 
 
