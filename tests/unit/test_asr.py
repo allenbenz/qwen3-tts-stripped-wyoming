@@ -164,9 +164,7 @@ class TestNativeAsrWrapperParsing:
         assert lang == "English"
 
     def test_forced_language_output_is_plain_text(self) -> None:
-        lang, text = self._wrapper()._parse_output(
-            "The living room lamp is on.", "English"
-        )
+        lang, text = self._wrapper()._parse_output("The living room lamp is on.", "English")
         assert text == "The living room lamp is on."
         assert lang == "English"
 
@@ -201,9 +199,7 @@ class FakeTemplateProcessor:
 
     def apply_chat_template(self, conversation, *, tokenize: bool, add_generation_prompt: bool):
         assert tokenize is False
-        system = next(
-            (m["content"] for m in conversation if m["role"] == "system"), ""
-        )
+        system = next((m["content"] for m in conversation if m["role"] == "system"), "")
         audio = any(
             isinstance(m["content"], list) and any(c.get("type") == "audio" for c in m["content"])
             for m in conversation
